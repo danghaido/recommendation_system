@@ -589,8 +589,6 @@ with tab4:
     with col2:
         k = st.slider("Top-K", 5, 20, 10, 1)
 
-    st.info(f"⏱️ Estimated time: ~{n_samples * 0.5:.0f}-{n_samples}s")
-
     if st.button("▶️ Run Evaluation", type="primary"):
         evaluator = MovieRecommenderEvaluator(df, recommend_by_title)
         results = evaluator.run_full_evaluation(n_samples=n_samples, k=k)

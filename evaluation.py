@@ -111,16 +111,11 @@ class MovieRecommenderEvaluator:
         progress_bar.empty()
         status_text.empty()
 
-        # Calculate RMSE & MAE
-        rmse = np.sqrt(mean_squared_error(rating_actual, rating_pred)) if rating_actual else 0
-        mae = mean_absolute_error(rating_actual, rating_pred) if rating_actual else 0
 
         return {
             "precision@k": np.mean(precision_scores) if precision_scores else 0,
             "recall@k": np.mean(recall_scores) if recall_scores else 0,
             "ndcg@k": np.mean(ndcg_scores) if ndcg_scores else 0,
-            "rmse": rmse,
-            "mae": mae,
             "n_evaluated": len(precision_scores),
         }
 
@@ -163,15 +158,13 @@ class MovieRecommenderEvaluator:
         st.subheader("Running evaluation...")
 
         # 1. Content-Based
-        st.write("**Accuracy Metrics (Precision, Recall, NDCG, RMSE, MAE)**")
+        st.write("**Accuracy Metrics (Precision, Recall, NDCG)**")
         content_results = self.evaluate_content_based(n_samples=n_samples, k=k)
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Precision@K", f"{content_results['precision@k']:.4f}")
         col2.metric("Recall@K", f"{content_results['recall@k']:.4f}")
         col3.metric("NDCG@K", f"{content_results['ndcg@k']:.4f}")
-        col4.metric("RMSE", f"{content_results['rmse']:.4f}")
-        col5.metric("MAE", f"{content_results['mae']:.4f}")
 
         st.caption(f"Evaluated {content_results['n_evaluated']} movies")
         st.markdown("---")
@@ -200,7 +193,6 @@ def display_evaluation_info():
     - **Precision@K**: Ratio of relevant movies in top-K (0-1, higher is better)
     - **Recall@K**: Ratio of relevant movies found (0-1, higher is better)
     - **NDCG@K**: Ranking quality (0-1, higher is better)
-    - **RMSE/MAE**: Rating error between original and recommended movies (lower is better)
     
     **Diversity Metrics:**
     - **Diversity**: Ratio of unique movies in total recommendations (0-1)
