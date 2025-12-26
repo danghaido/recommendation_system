@@ -6,18 +6,23 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from chatbot import (
+    DEFAULT_MODEL_CONFIG,
+    create_context_from_movies,
+    create_prompt,
+    query_llm_model,
+    retrieve_relevant_movies,
+)
 from evaluation import MovieRecommenderEvaluator, display_evaluation_info
 
-# ---- PATH đến file dataset local của bạn ----
 DATA_PATH = "csv/processed_data.csv"
 
 
-# ---------- Helpers & Caching ----------
 @st.cache_data(show_spinner=False)
 def load_data(path):
     df = pd.read_csv(path)
     # basic clean
-    df = df.fillna({"overview": "", "genres": "", "cast": "", "director": ""})
+    df = df.fillna({"overview": "", "genres": "", "cast": "", "director": "", "release_date": ""})
 
     # parse genres_list từ string về list (nếu cần)
     import ast
@@ -29,15 +34,28 @@ def load_data(path):
             else (x if isinstance(x, list) else [])
         )
 
-    # tạo combined text cho embedding
+    # Extract year from release_date
+    df["year"] = pd.to_datetime(df["release_date"], errors="coerce").dt.year.astype(str)
+    
+    # Tạo combined text ĐẦY ĐỦ cho embedding (dùng chung cho cả recommendation và chatbot)
+    # Bao gồm: Title, Year, Director (x2 để tăng trọng số), Genres, Cast, Rating, Overview
     df["combined"] = (
-        df["genres"].astype(str)
-        + " "
-        + df["overview"].astype(str)
-        + " "
-        + df["cast"].astype(str)
-        + " "
+        "Title: "
+        + df["title"].astype(str)
+        + ". Year: "
+        + df["year"].astype(str)
+        + ". Director: "
         + df["director"].astype(str)
+        + ". Director: "
+        + df["director"].astype(str)  # Lặp lại để boost trọng số
+        + ". Genres: "
+        + df["genres"].astype(str)
+        + ". Cast: "
+        + df["cast"].astype(str)
+        + ". Rating: "
+        + df["vote_average"].astype(str)
+        + "/10. Overview: "
+        + df["overview"].astype(str)
     )
     return df
 
@@ -48,8 +66,11 @@ def load_sentence_model():
 
 
 @st.cache_data(show_spinner=False)
-def compute_bert_embeddings(combined_texts, _model):  # underscore để bypass hash
+def compute_embeddings(combined_texts, _model):
+    """Compute embeddings once for both recommendation system and chatbot"""
+    print(f"🔄 Computing embeddings for {len(combined_texts)} movies...")
     embeddings = _model.encode(combined_texts, show_progress_bar=False)
+    print("✅ Embeddings computed and cached!")
     return embeddings
 
 
@@ -71,7 +92,8 @@ st.title("Movie Recommender — Demo")
 
 df = load_data(DATA_PATH)
 model = load_sentence_model()
-bert_embeddings = compute_bert_embeddings(df["combined"].tolist(), model)
+# Compute embeddings once for both recommendation system and chatbot
+embeddings = compute_embeddings(df["combined"].tolist(), model)
 cast_director_corpus = (df["cast"].astype(str) + " " + df["director"].astype(str)).tolist()
 tfidf_vectorizer, tfidf_matrix = fit_tfidf_on_cast_director(cast_director_corpus)
 
@@ -117,7 +139,7 @@ def recommend_by_title(title, topn=6):
     if title not in indices:
         return pd.DataFrame()
     idx = indices[title]
-    sims = cosine_similarity([bert_embeddings[idx]], bert_embeddings).flatten()
+    sims = cosine_similarity([embeddings[idx]], embeddings).flatten()
     top_idx = np.argsort(sims)[::-1][1 : topn + 1]  # skip itself
     return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
 
@@ -135,8 +157,8 @@ def recommend_by_genre(genre_name, topn=6):
     if mask.sum() == 0:
         return pd.DataFrame()
     # compute centroid of those movies then find nearest neighbors in embedding space
-    centroid = bert_embeddings[mask].mean(axis=0)
-    sims = cosine_similarity([centroid], bert_embeddings).flatten()
+    centroid = embeddings[mask].mean(axis=0)
+    sims = cosine_similarity([centroid], embeddings).flatten()
     top_idx = np.argsort(sims)[::-1][:topn]
     return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
 
@@ -195,11 +217,11 @@ def recommend_by_search_history(history_list, topn=7):
     all_matched_indices = list(set(all_matched_indices))
 
     # Tính embedding trung bình
-    matched_embeddings = bert_embeddings[all_matched_indices]
+    matched_embeddings = embeddings[all_matched_indices]
     centroid = matched_embeddings.mean(axis=0)
 
     # Tìm phim tương tự (loại bỏ các phim đã có trong history)
-    sims = cosine_similarity([centroid], bert_embeddings).flatten()
+    sims = cosine_similarity([centroid], embeddings).flatten()
 
     # Loại bỏ các phim đã match
     for idx in all_matched_indices:
@@ -334,7 +356,7 @@ def display_movie_cards(movie_df, key_prefix="card"):
 
 
 # ---------- UI: tabs ----------
-tab1, tab2, tab3, tab4 = st.tabs(["Home", "Search", "Statistics", "Evaluation"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Home", "Search", "Statistics", "Evaluation", "Chatbot"])
 
 with tab1:
     st.header("Home — Quick Recommendations")
@@ -601,3 +623,214 @@ with tab4:
             result_df = pd.DataFrame([{**results["content"], **results["diversity"]}])
             result_df.to_csv("evaluation_results.csv", index=False)
             st.success("✅ Saved to evaluation_results.csv")
+
+with tab5:
+    st.header("🤖 AI Chatbot - Ask About Movies")
+    st.markdown("Chat with AI to get personalized movie recommendations and information")
+
+    # Initialize chatbot session state
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+
+    if "chat_api_key_verified" not in st.session_state:
+        st.session_state["chat_api_key_verified"] = False
+
+    if "chat_api_key" not in st.session_state:
+        st.session_state["chat_api_key"] = ""
+
+    if "chat_embeddings" not in st.session_state:
+        st.session_state["chat_embeddings"] = None
+
+    if "chat_model_provider" not in st.session_state:
+        st.session_state["chat_model_provider"] = "huggingface"
+
+    if "chat_model_name" not in st.session_state:
+        st.session_state["chat_model_name"] = DEFAULT_MODEL_CONFIG["huggingface"]["model_name"]
+
+    if "chat_base_url" not in st.session_state:
+        st.session_state["chat_base_url"] = ""
+
+    # Sidebar configuration in expander
+    with st.expander("⚙️ API Configuration", expanded=not st.session_state["chat_api_key_verified"]):
+        if not st.session_state["chat_api_key_verified"]:
+            st.warning("🔑 Configure your LLM provider to start chatting")
+
+            # Model provider selection
+            provider = st.selectbox(
+                "Select Provider",
+                ["huggingface", "openai", "gemini", "custom"],
+                help="Choose your LLM provider",
+                key="provider_select",
+            )
+
+            # Model name input
+            default_model = DEFAULT_MODEL_CONFIG[provider]["model_name"]
+            model_name_input = st.text_input(
+                "Model Name",
+                value=default_model,
+                help="e.g., gpt-3.5-turbo, gemini/gemini-pro, huggingface/model-name",
+                key="model_name_input",
+            )
+
+            # Base URL (only for custom)
+            base_url_input = ""
+            if provider == "custom":
+                base_url_input = st.text_input(
+                    "Base URL",
+                    value="http://localhost:8000/v1",
+                    help="Your self-hosted model endpoint",
+                    key="base_url_input",
+                )
+
+            # API Key input
+            api_key_help_text = {
+                "huggingface": "Get from https://huggingface.co/settings/tokens",
+                "openai": "Get from https://platform.openai.com/api-keys",
+                "gemini": "Get from https://makersuite.google.com/app/apikey",
+                "custom": "Your API key for the custom endpoint",
+            }
+
+            api_key_input = st.text_input(
+                f"{provider.title()} API Key",
+                type="password",
+                help=api_key_help_text.get(provider, "Your API key"),
+                key="chatbot_api_key_input",
+            )
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Verify & Start", type="primary", key="verify_btn"):
+                    if api_key_input.strip():
+                        # Test API key with a simple request
+                        test_prompt = create_prompt("Say hello", "No context needed for test.", provider)
+                        with st.spinner("Verifying API key and model..."):
+                            response = query_llm_model(
+                                api_key_input,
+                                test_prompt,
+                                model_name=model_name_input,
+                                base_url=base_url_input if base_url_input else None,
+                                max_tokens=10,
+                            )
+
+                        if not response.startswith("Error"):
+                            st.session_state["chat_api_key"] = api_key_input
+                            st.session_state["chat_model_provider"] = provider
+                            st.session_state["chat_model_name"] = model_name_input
+                            st.session_state["chat_base_url"] = base_url_input
+                            st.session_state["chat_api_key_verified"] = True
+
+                            # Use already computed embeddings (no need to recompute!)
+                            st.session_state["chat_embeddings"] = embeddings
+
+                            st.success("✅ Model verified successfully!")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Verification failed: {response}")
+                    else:
+                        st.error("❌ Please enter a valid API key")
+
+            st.info("""
+            **API Key Resources:**
+            - **Huggingface**: [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+            - **OpenAI**: [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+            - **Gemini**: [makersuite.google.com/app/apikey](https://makersuite.google.com/app/apikey)
+            - **Custom**: Your self-hosted endpoint credentials
+            """)
+
+        else:
+            st.success("✅ API Key Verified")
+            st.info(f"🤖 Provider: **{st.session_state['chat_model_provider'].title()}**")
+            st.info(f"📦 Model: **{st.session_state['chat_model_name']}**")
+            if st.session_state["chat_base_url"]:
+                st.info(f"🔗 Endpoint: **{st.session_state['chat_base_url']}**")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔄 Change Configuration", key="change_key_btn"):
+                    st.session_state["chat_api_key_verified"] = False
+                    st.session_state["chat_api_key"] = ""
+                    st.session_state["chat_messages"] = []
+                    st.rerun()
+
+            with col2:
+                if st.button("🗑️ Clear Chat", key="clear_chat_btn"):
+                    st.session_state["chat_messages"] = []
+                    st.rerun()
+
+    # Display example questions if not verified
+    if not st.session_state["chat_api_key_verified"]:
+        st.markdown("---")
+        st.subheader("💡 Example Questions You Can Ask:")
+        st.markdown("""
+        - What are the best action movies in the database?
+        - Tell me about movies directed by Christopher Nolan
+        - Recommend some high-rated comedy movies
+        - What movies feature Tom Hanks?
+        - Show me romantic movies with good ratings
+        - Compare Marvel and DC movies
+        - What are some underrated gems?
+        """)
+        st.stop()
+
+    # Main chat interface
+    st.markdown("---")
+
+    # Display chat history
+    for message in st.session_state["chat_messages"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+            # Display retrieved movies if available
+            if message["role"] == "assistant" and "retrieved_movies" in message:
+                with st.expander("📚 Retrieved Movies from Database", expanded=False):
+                    for idx, row in message["retrieved_movies"].iterrows():
+                        st.markdown(f"**{row['title']}** ({row['genres']}) - ⭐ {row['vote_average']}/10")
+                        st.caption(f"Director: {row['director']} | Cast: {row['cast']}")
+
+    # Chat input
+    if user_input := st.chat_input("Ask me about movies...", key="chatbot_input"):
+        # Add user message
+        st.session_state["chat_messages"].append({"role": "user", "content": user_input})
+
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("🔍 Searching database and generating response..."):
+                # Step 1: Retrieve relevant movies (RAG)
+                relevant_movies, scores = retrieve_relevant_movies(
+                    user_input, st.session_state["chat_embeddings"], df, model, top_k=10
+                )
+
+                # Debug: Show how many movies were retrieved
+                st.info(f"🎬 Retrieved {len(relevant_movies)} movies from database")
+
+                # Step 2: Create context
+                context = create_context_from_movies(relevant_movies)
+
+                # Step 3: Create prompt
+                prompt = create_prompt(user_input, context, st.session_state["chat_model_provider"])
+
+                # Step 4: Query LLM
+                response = query_llm_model(
+                    st.session_state["chat_api_key"],
+                    prompt,
+                    model_name=st.session_state["chat_model_name"],
+                    base_url=st.session_state["chat_base_url"] if st.session_state["chat_base_url"] else None,
+                    max_tokens=500,
+                )
+
+                # Display response
+                st.markdown(response)
+
+                # Display retrieved movies
+                with st.expander("📚 Retrieved Movies from Database", expanded=False):
+                    for idx, row in relevant_movies.iterrows():
+                        st.markdown(f"**{row['title']}** ({row['genres']}) - ⭐ {row['vote_average']}/10")
+                        st.caption(f"Director: {row['director']} | Cast: {row['cast']}")
+
+                # Save assistant message
+                st.session_state["chat_messages"].append(
+                    {"role": "assistant", "content": response, "retrieved_movies": relevant_movies}
+                )
