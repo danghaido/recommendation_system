@@ -33,34 +33,70 @@ DEFAULT_MODEL_CONFIG = {
 }
 
 
-def retrieve_relevant_movies(query, embeddings, df, embedding_model, top_k=10):
+def retrieve_relevant_movies(query, embeddings, df, embedding_model, top_k=50, chromadb_collection=None):
     """
     Retrieve top-k most relevant movies based on query using RAG
+    Supports both ChromaDB Cloud and local embeddings
 
     Args:
         query: User query string
-        embeddings: Pre-computed embeddings for all movies
+        embeddings: Pre-computed embeddings for all movies (fallback)
         df: Movie dataframe
         embedding_model: SentenceTransformer model
         top_k: Number of movies to retrieve
+        chromadb_collection: ChromaDB collection (optional, for cloud search)
 
     Returns:
         relevant_movies: DataFrame of top-k relevant movies
         scores: Similarity scores
     """
-    # Encode query
-    query_embedding = embedding_model.encode([query])
+    # Try ChromaDB first if available
+    if chromadb_collection is not None:
+        try:
+            from chromadb_helper import search_similar_movies_by_text
 
-    # Compute similarity
-    similarities = cosine_similarity(query_embedding, embeddings).flatten()
+            # Search using ChromaDB
+            similar_titles = search_similar_movies_by_text(
+                chromadb_collection, query, embedding_model, top_k=min(100, top_k * 2)
+            )
 
-    # Get top-k indices
-    top_indices = np.argsort(similarities)[::-1][:top_k]
+            # Map titles to dataframe
+            if similar_titles:
+                # Create indices mapping
+                indices = pd.Series(df.index, index=df["title"].astype(str)).drop_duplicates()
 
-    # Get relevant movies
-    relevant_movies = df.iloc[top_indices]
+                result_indices = []
+                for title in similar_titles:
+                    if title in indices.index:
+                        idx_value = indices[title]
+                        if hasattr(idx_value, "iloc"):
+                            idx_value = idx_value.iloc[0]
+                        result_indices.append(int(idx_value))
+                    if len(result_indices) >= top_k:
+                        break
 
-    return relevant_movies, similarities[top_indices]
+                if result_indices:
+                    relevant_movies = df.iloc[result_indices]
+                    # Return dummy scores (all 1.0) since ChromaDB uses distance
+                    scores = np.ones(len(result_indices))
+                    print(f"✅ Retrieved {len(result_indices)} movies from ChromaDB Cloud")
+                    return relevant_movies, scores
+        except Exception as e:
+            print(f"ChromaDB chatbot search failed, using local fallback: {e}")
+
+    # Fallback to local embeddings (only if available)
+    if embeddings is not None:
+        query_embedding = embedding_model.encode([query])
+        similarities = cosine_similarity(query_embedding, embeddings).flatten()
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        relevant_movies = df.iloc[top_indices]
+
+        print(f"✅ Retrieved {len(top_indices)} movies from local embeddings")
+        return relevant_movies, similarities[top_indices]
+
+    # No retrieval method available
+    print("❌ No embeddings or ChromaDB available for retrieval")
+    return pd.DataFrame(), np.array([])
 
 
 def create_context_from_movies(movies_df):

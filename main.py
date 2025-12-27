@@ -15,7 +15,26 @@ from chatbot import (
 )
 from evaluation import MovieRecommenderEvaluator, display_evaluation_info
 
+# Import ChromaDB helper functions
+try:
+    from chromadb_helper import (
+        get_chromadb_client,
+        get_chromadb_collection,
+        get_movie_embedding_by_index,
+        search_similar_movies_by_embedding,
+        search_similar_movies_by_text,
+    )
+    from chromadb_helper import (
+        load_sentence_model as load_model_chromadb,
+    )
+
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+    st.warning("ChromaDB helper not available. Install chromadb package or use local embeddings.")
+
 DATA_PATH = "csv/processed_data.csv"
+USE_CHROMADB = True
 
 
 @st.cache_data(show_spinner=False)
@@ -36,7 +55,7 @@ def load_data(path):
 
     # Extract year from release_date
     df["year"] = pd.to_datetime(df["release_date"], errors="coerce").dt.year.astype(str)
-    
+
     # Tạo combined text ĐẦY ĐỦ cho embedding (dùng chung cho cả recommendation và chatbot)
     # Bao gồm: Title, Year, Director (x2 để tăng trọng số), Genres, Cast, Rating, Overview
     df["combined"] = (
@@ -68,9 +87,9 @@ def load_sentence_model():
 @st.cache_data(show_spinner=False)
 def compute_embeddings(combined_texts, _model):
     """Compute embeddings once for both recommendation system and chatbot"""
-    print(f"🔄 Computing embeddings for {len(combined_texts)} movies...")
+    print(f"Computing embeddings for {len(combined_texts)} movies...")
     embeddings = _model.encode(combined_texts, show_progress_bar=False)
-    print("✅ Embeddings computed and cached!")
+    print("Embeddings computed and cached!")
     return embeddings
 
 
@@ -87,17 +106,63 @@ def cos_sim_vec(a, M):
 
 
 # ---------- Load everything ----------
-st.set_page_config(layout="wide", page_title="Movie Recommender Demo")
-st.title("Movie Recommender — Demo")
+st.set_page_config(layout="wide", page_title="🎬 Movie Recommender", page_icon="🎬", initial_sidebar_state="collapsed")
 
+
+# Load CSS from external file
+def load_css():
+    try:
+        with open("styles.css", "r", encoding="utf-8") as f:
+            css = f.read()
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+    except FileNotFoundError:
+        st.warning("styles.css not found. Using default styling.")
+
+
+load_css()
+
+st.title("🎬 Movie Recommender System")
+
+# Load data
 df = load_data(DATA_PATH)
-model = load_sentence_model()
-# Compute embeddings once for both recommendation system and chatbot
-embeddings = compute_embeddings(df["combined"].tolist(), model)
+
+# Try ChromaDB first, fallback to local embeddings
+chromadb_client = None
+chromadb_collection = None
+embeddings = None
+model = None
+
+if USE_CHROMADB and CHROMADB_AVAILABLE:
+    st.info("🔄 Attempting to connect to ChromaDB Cloud...")
+    try:
+        chromadb_client = get_chromadb_client()
+        if chromadb_client is not None:
+            collection_name = st.secrets.get("chromadb", {}).get("collection_name", "movie_embeddings")
+            chromadb_collection = get_chromadb_collection(chromadb_client, collection_name)
+            model = load_model_chromadb()
+
+            if chromadb_collection is not None:
+                st.success("✅ Connected to ChromaDB Cloud successfully!")
+            else:
+                st.warning("⚠️ ChromaDB collection not found. Falling back to local embeddings...")
+                chromadb_client = None
+        else:
+            st.warning("⚠️ ChromaDB connection failed. Falling back to local embeddings...")
+    except Exception as e:
+        st.warning(f"⚠️ ChromaDB error: {e}. Falling back to local embeddings...")
+        chromadb_client = None
+        chromadb_collection = None
+
+# Load local embeddings if ChromaDB not available
+if chromadb_collection is None:
+    if model is None:
+        model = load_sentence_model()
+    with st.spinner("⏳ Computing embeddings for recommendation system... (this may take 30-60 seconds on first run)"):
+        embeddings = compute_embeddings(df["combined"].tolist(), model)
+
 cast_director_corpus = (df["cast"].astype(str) + " " + df["director"].astype(str)).tolist()
 tfidf_vectorizer, tfidf_matrix = fit_tfidf_on_cast_director(cast_director_corpus)
 
-# index lookup
 indices = pd.Series(df.index, index=df["title"].astype(str)).drop_duplicates()
 
 # ---------- Session state: search history ----------
@@ -122,6 +187,12 @@ if "history_recommendations" not in st.session_state:
 if "context_results" not in st.session_state:
     st.session_state["context_results"] = None
 
+if "liked_movies" not in st.session_state:
+    st.session_state["liked_movies"] = []
+
+if "liked_recommendations" not in st.session_state:
+    st.session_state["liked_recommendations"] = None
+
 
 def push_history(q):
     hist = st.session_state["search_history"]
@@ -134,14 +205,58 @@ def push_history(q):
     st.session_state["history_recommendations"] = None
 
 
-# ---------- Recommendation functions ----------
+# ---------- Recommendation functions with ChromaDB and local fallback ----------
+
+
+def map_titles_to_indices(titles):
+    """Map list of titles to DataFrame indices"""
+    result_indices = []
+    for title in titles:
+        if title in indices.index:
+            idx_value = indices[title]
+            # Ensure it's a scalar (not Series)
+            if hasattr(idx_value, "iloc"):
+                # It's a Series, take first value
+                idx_value = idx_value.iloc[0]
+            # Convert to Python int
+            result_indices.append(int(idx_value))
+    return result_indices
+
+
 def recommend_by_title(title, topn=6):
+    """Recommend movies similar to a given title"""
     if title not in indices:
         return pd.DataFrame()
+
     idx = indices[title]
-    sims = cosine_similarity([embeddings[idx]], embeddings).flatten()
-    top_idx = np.argsort(sims)[::-1][1 : topn + 1]  # skip itself
-    return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
+
+    # Try ChromaDB first
+    if chromadb_collection is not None:
+        try:
+            movie_embedding = get_movie_embedding_by_index(chromadb_collection, idx)
+            if movie_embedding is not None:
+                similar_titles = search_similar_movies_by_embedding(
+                    chromadb_collection, movie_embedding, top_k=min(100, topn * 3), excluded_indices=[idx]
+                )
+                # Map titles to indices
+                similar_indices = map_titles_to_indices(similar_titles)
+                similar_indices = [i for i in similar_indices if i != idx][:topn]
+                if similar_indices:
+                    result_df = df.iloc[similar_indices][
+                        ["title", "genres", "cast", "director", "vote_average", "overview"]
+                    ]
+                    return result_df.sort_values("vote_average", ascending=False).head(topn)
+        except Exception as e:
+            st.warning(f"ChromaDB search failed, using local fallback: {e}")
+
+    # Fallback to local embeddings
+    if embeddings is not None:
+        emb = embeddings[idx].reshape(1, -1)
+        sims = cosine_similarity(emb, embeddings).flatten()
+        top_idx = np.argsort(sims)[::-1][1 : topn + 1]
+        return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
+
+    return pd.DataFrame()
 
 
 def recommend_by_director(director_name, topn=6):
@@ -152,15 +267,34 @@ def recommend_by_director(director_name, topn=6):
 
 
 def recommend_by_genre(genre_name, topn=6):
-    # filter movies that have the genre in genres_list
+    """Recommend movies by genre"""
     mask = df["genres_list"].apply(lambda x: genre_name in x if isinstance(x, list) else False)
     if mask.sum() == 0:
         return pd.DataFrame()
-    # compute centroid of those movies then find nearest neighbors in embedding space
-    centroid = embeddings[mask].mean(axis=0)
-    sims = cosine_similarity([centroid], embeddings).flatten()
-    top_idx = np.argsort(sims)[::-1][:topn]
-    return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
+
+    # Try ChromaDB first
+    if chromadb_collection is not None:
+        try:
+            query_text = f"Movies with genre {genre_name}. {genre_name} films and cinema."
+            similar_titles = search_similar_movies_by_text(
+                chromadb_collection, query_text, model, top_k=min(100, topn * 5)
+            )
+            # Map titles to indices
+            similar_indices = map_titles_to_indices(similar_titles)
+            if similar_indices:
+                result_df = df.iloc[similar_indices]
+                result_df = result_df[
+                    result_df["genres_list"].apply(lambda x: genre_name in x if isinstance(x, list) else False)
+                ]
+                if not result_df.empty:
+                    result_df = result_df.sort_values("vote_average", ascending=False)
+                    return result_df[["title", "genres", "cast", "director", "vote_average", "overview"]].head(topn)
+        except Exception as e:
+            st.warning(f"ChromaDB search failed, using local fallback: {e}")
+
+    # Fallback: return highest rated movies of this genre
+    filtered = df[mask].sort_values("vote_average", ascending=False).head(topn)
+    return filtered[["title", "genres", "cast", "director", "vote_average", "overview"]]
 
 
 def recommend_by_filters(director_name=None, genre_name=None, topn=8):
@@ -190,45 +324,108 @@ def recommend_by_filters(director_name=None, genre_name=None, topn=8):
 def recommend_by_search_history(history_list, topn=7):
     """
     Gợi ý phim dựa trên lịch sử tìm kiếm.
-    Tính embedding trung bình của các phim đã tìm và tìm phim tương tự.
     """
     if not history_list:
         return pd.DataFrame()
 
-    # Tìm tất cả phim matching với history
-    all_matched_indices = []
-    for query in history_list:
-        q_normalized = query.lower().replace(" ", "").replace("-", "").replace(":", "")
-        df_normalized = (
-            df["title"]
-            .str.lower()
-            .str.replace(" ", "", regex=False)
-            .str.replace("-", "", regex=False)
-            .str.replace(":", "", regex=False)
-        )
-        mask = df_normalized.str.contains(q_normalized, na=False)
-        matched_idx = df[mask].index.tolist()
-        all_matched_indices.extend(matched_idx)
+    # Try ChromaDB first
+    if chromadb_collection is not None:
+        try:
+            query_text = "Movies similar to: " + ", ".join(history_list) + ". Recommendations based on these titles."
+            similar_titles = search_similar_movies_by_text(
+                chromadb_collection, query_text, model, top_k=min(100, topn * 3)
+            )
+            # Map titles to indices
+            similar_indices = map_titles_to_indices(similar_titles)
+            if similar_indices:
+                result_df = df.iloc[similar_indices][
+                    ["title", "genres", "cast", "director", "vote_average", "overview"]
+                ]
+                result_df = result_df.sort_values("vote_average", ascending=False).head(topn)
+                return result_df
+        except Exception as e:
+            st.warning(f"ChromaDB search failed, using local fallback: {e}")
 
-    if not all_matched_indices:
+    # Fallback to local embeddings
+    if embeddings is not None:
+        query_emb = model.encode([" ".join(history_list)])
+        sims = cosine_similarity(query_emb, embeddings).flatten()
+        top_idx = np.argsort(sims)[::-1][:topn]
+        return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
+
+    return pd.DataFrame()
+
+
+def recommend_by_liked_movies(liked_list, topn=10):
+    """
+    Gợi ý phim dựa trên danh sách phim đã thích.
+    """
+    if not liked_list:
         return pd.DataFrame()
 
-    # Loại bỏ duplicate
-    all_matched_indices = list(set(all_matched_indices))
+    liked_indices = []
+    for movie_title in liked_list:
+        if movie_title in indices:
+            liked_indices.append(indices[movie_title])
 
-    # Tính embedding trung bình
-    matched_embeddings = embeddings[all_matched_indices]
-    centroid = matched_embeddings.mean(axis=0)
+    if not liked_indices:
+        return pd.DataFrame()
 
-    # Tìm phim tương tự (loại bỏ các phim đã có trong history)
-    sims = cosine_similarity([centroid], embeddings).flatten()
+    # Try ChromaDB first
+    if chromadb_collection is not None:
+        try:
+            liked_embeddings = []
+            for idx in liked_indices:
+                emb = get_movie_embedding_by_index(chromadb_collection, idx)
+                if emb is not None:
+                    # Ensure it's a 1D numpy array
+                    if isinstance(emb, np.ndarray):
+                        liked_embeddings.append(emb.flatten())
 
-    # Loại bỏ các phim đã match
-    for idx in all_matched_indices:
-        sims[idx] = -1
+            if not liked_embeddings:
+                query_text = "Movies similar to: " + ", ".join(liked_list)
+                similar_titles = search_similar_movies_by_text(
+                    chromadb_collection, query_text, model, top_k=min(150, topn * 5)
+                )
+                # Map titles to indices
+                similar_indices = map_titles_to_indices(similar_titles)
+                similar_indices = [i for i in similar_indices if i not in liked_indices][:topn]
+                if similar_indices:
+                    result_df = df.iloc[similar_indices][
+                        ["title", "genres", "cast", "director", "vote_average", "overview"]
+                    ]
+                    return result_df.sort_values("vote_average", ascending=False).head(topn)
+            else:
+                # Stack embeddings and compute mean
+                avg_embedding = np.mean(np.stack(liked_embeddings), axis=0)
+                similar_titles = search_similar_movies_by_embedding(
+                    chromadb_collection,
+                    avg_embedding,
+                    top_k=min(200, topn * 5 + len(liked_indices)),
+                    excluded_indices=liked_indices,
+                )
+                # Map titles to indices
+                similar_indices = map_titles_to_indices(similar_titles)
+                similar_indices = [i for i in similar_indices if i not in liked_indices][:topn]
+                if similar_indices:
+                    result_df = df.iloc[similar_indices][
+                        ["title", "genres", "cast", "director", "vote_average", "overview"]
+                    ]
+                    return result_df.sort_values("vote_average", ascending=False).head(topn)
+        except Exception as e:
+            st.warning(f"ChromaDB search failed, using local fallback: {e}")
 
-    top_idx = np.argsort(sims)[::-1][:topn]
-    return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
+    # Fallback to local embeddings
+    if embeddings is not None:
+        avg_emb = np.mean(embeddings[liked_indices], axis=0).reshape(1, -1)
+        sims = cosine_similarity(avg_emb, embeddings).flatten()
+        # Exclude liked movies
+        for idx in liked_indices:
+            sims[idx] = -1
+        top_idx = np.argsort(sims)[::-1][:topn]
+        return df.iloc[top_idx][["title", "genres", "cast", "director", "vote_average", "overview"]]
+
+    return pd.DataFrame()
 
 
 def recommend_by_context(title, context_time=None, context_mood=None, topn=10):
@@ -287,38 +484,63 @@ def recommend_by_context(title, context_time=None, context_mood=None, topn=10):
     return base_recs.head(topn)
 
 
-def display_movie_list(movie_df, key_prefix="movie"):
-    """
-    Hiển thị danh sách phim với nút Mô tả để xem overview.
-    """
+def display_movie_list(movie_df, key_prefix="movie", show_like_button=True):
+    """Hiển thị danh sách phim với nút Mô tả và nút Like - Enhanced UI."""
     for idx, row in movie_df.iterrows():
-        col1, col2 = st.columns([4, 1])
+        is_liked = row["title"] in st.session_state["liked_movies"]
+
+        st.markdown(
+            f"""
+        <div class="movie-card">
+            <h3>🎬 {row["title"]}</h3>
+            <p class="movie-genre"><span>Genre:</span> {row["genres"]}</p>
+            <p class="movie-rating">⭐ {row["vote_average"]}/10</p>
+            <p class="movie-cast"><strong>🎭 Cast:</strong> {row["cast"][:100]}{"..." if len(str(row["cast"])) > 100 else ""}</p>
+            <p class="movie-director"><strong>🎥 Director:</strong> {row["director"]}</p>
+        </div>
+        """,
+            unsafe_allow_html=True,
+        )
+
+        col1, col2, col3 = st.columns([1, 1, 4])
+
         with col1:
-            st.write(f"**{row['title']}** - {row['genres']} - ⭐ {row['vote_average']}")
-            st.caption(f"**Cast:** {row['cast']}")
-            st.caption(f"**Director:** {row['director']}")
-        with col2:
             btn_key = f"{key_prefix}_{idx}"
-            if st.button("📖 Description", key=btn_key):
+            if st.button("📖 Description", key=btn_key, use_container_width=True):
                 st.session_state[f"show_overview_{btn_key}"] = not st.session_state.get(
                     f"show_overview_{btn_key}", False
                 )
 
-        # Hiển thị overview nếu được chọn
+        with col2:
+            if show_like_button:
+                like_btn_key = f"like_{key_prefix}_{idx}"
+                if is_liked:
+                    if st.button("💔 Unlike", key=like_btn_key, use_container_width=True):
+                        st.session_state["liked_movies"].remove(row["title"])
+                        st.session_state["liked_recommendations"] = None
+                        st.rerun()
+                else:
+                    if st.button("❤️ Like", key=like_btn_key, use_container_width=True):
+                        if row["title"] not in st.session_state["liked_movies"]:
+                            st.session_state["liked_movies"].append(row["title"])
+                            st.session_state["liked_recommendations"] = None
+                        st.rerun()
+
         if st.session_state.get(f"show_overview_{btn_key}", False):
-            st.info(f"**Summary:** {row['overview']}")
+            st.markdown(
+                f"""
+            <div class="movie-overview">
+                <p><strong style="color: #667eea;">📝 Summary:</strong><br>{row["overview"]}</p>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
 
-        st.markdown("---")
 
-
-def display_movie_cards(movie_df, key_prefix="card"):
-    """
-    Hiển thị danh sách phim dạng card đẹp hơn cho gợi ý lịch sử.
-    """
-    # Hiển thị 3 phim mỗi hàng
+def display_movie_cards(movie_df, key_prefix="card", show_like_button=True):
+    """Hiển thị danh sách phim dạng card đẹp hơn cho gợi ý lịch sử."""
     cols_per_row = 3
     rows = len(movie_df) // cols_per_row + (1 if len(movie_df) % cols_per_row != 0 else 0)
-
     movie_list = list(movie_df.iterrows())
 
     for row_idx in range(rows):
@@ -327,39 +549,63 @@ def display_movie_cards(movie_df, key_prefix="card"):
             movie_idx = row_idx * cols_per_row + col_idx
             if movie_idx < len(movie_list):
                 idx, row = movie_list[movie_idx]
+                is_liked = row["title"] in st.session_state["liked_movies"]
+
                 with cols[col_idx]:
-                    # Card container với border
                     st.markdown(
                         f"""
-                    <div style='padding: 15px; border: 1px solid #ddd; border-radius: 10px; background-color: #f9f9f9; height: 100%;'>
-                        <h4 style='margin: 0 0 10px 0; color: #1f77b4;'>{row["title"]}</h4>
-                        <p style='margin: 5px 0; font-size: 14px;'><b>Genre:</b> {row["genres"]}</p>
-                        <p style='margin: 5px 0; font-size: 14px;'><b>Rating:</b> ⭐ {row["vote_average"]}</p>
-                        <p style='margin: 5px 0; font-size: 13px; color: #666;'><b>Director:</b> {row["director"]}</p>
+                    <div class="movie-card-grid">
+                        <h4>🎬 {row["title"]}</h4>
+                        <p style="margin: 8px 0; font-size: 14px; color: #4a5568;">
+                            <span style="font-weight: 600; color: #667eea;">Genre:</span> {row["genres"][:50]}{"..." if len(str(row["genres"])) > 50 else ""}
+                        </p>
+                        <p style="margin: 8px 0; font-size: 15px; font-weight: 600; color: #e97b20;">
+                            ⭐ {row["vote_average"]}/10
+                        </p>
+                        <p style="margin: 8px 0; font-size: 13px; color: #718096;">
+                            <span style="font-weight: 600; color: #2d3748;">🎥 Director:</span> {row["director"][:30]}{"..." if len(str(row["director"])) > 30 else ""}
+                        </p>
                     </div>
                     """,
                         unsafe_allow_html=True,
                     )
 
-                    # Description button
-                    btn_key = f"{key_prefix}_{idx}"
-                    if st.button("📖 View Description", key=btn_key, use_container_width=True):
-                        st.session_state[f"show_overview_{btn_key}"] = not st.session_state.get(
-                            f"show_overview_{btn_key}", False
-                        )
+                    btn_col1, btn_col2 = st.columns(2)
 
-                    # Display overview if selected
+                    with btn_col1:
+                        btn_key = f"{key_prefix}_{idx}"
+                        if st.button("📖 Description", key=btn_key, use_container_width=True):
+                            st.session_state[f"show_overview_{btn_key}"] = not st.session_state.get(
+                                f"show_overview_{btn_key}", False
+                            )
+
+                    with btn_col2:
+                        if show_like_button:
+                            like_btn_key = f"like_{key_prefix}_{idx}"
+                            if is_liked:
+                                if st.button("💔 Unlike", key=like_btn_key, use_container_width=True):
+                                    st.session_state["liked_movies"].remove(row["title"])
+                                    st.session_state["liked_recommendations"] = None
+                                    st.rerun()
+                            else:
+                                if st.button("❤️ Like", key=like_btn_key, use_container_width=True):
+                                    if row["title"] not in st.session_state["liked_movies"]:
+                                        st.session_state["liked_movies"].append(row["title"])
+                                        st.session_state["liked_recommendations"] = None
+                                    st.rerun()
+
                     if st.session_state.get(f"show_overview_{btn_key}", False):
                         st.info(f"**Summary:** {row['overview']}")
-
-                    st.markdown("<br>", unsafe_allow_html=True)
 
 
 # ---------- UI: tabs ----------
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Home", "Search", "Statistics", "Evaluation", "Chatbot"])
 
 with tab1:
-    st.header("Home — Quick Recommendations")
+    st.markdown(
+        '<div class="page-header"><h1>🏠 Home — Quick Recommendations</h1><p>Discover your next favorite movie with our smart recommendation system</p></div>',
+        unsafe_allow_html=True,
+    )
 
     # Top directors & genres list
     top_directors = df["director"].value_counts().head(50).index.tolist()
@@ -460,36 +706,46 @@ with tab1:
             display_movie_list(res, key_prefix="context")
 
 with tab2:
-    st.header("Search — Find Movies & Search History (5 most recent)")
+    st.markdown(
+        '<div class="page-header"><h1>🔍 Search Movies</h1><p>Find your favorite movies and track your search history</p></div>',
+        unsafe_allow_html=True,
+    )
 
     # Search input
-    q = st.text_input("Enter movie name (partial name allowed)", "")
+    q = st.text_input("🔎 Search for a movie title", placeholder="Enter movie title...", key="movie_search")
 
-    if st.button("🔍 Search", type="primary"):
-        if q.strip() == "":
-            st.warning("⚠️ Please enter a movie name to search.")
-        else:
-            # fuzzy search: normalize by removing spaces and special chars
-            q_normalized = q.lower().replace(" ", "").replace("-", "").replace(":", "")
-            df_normalized = (
-                df["title"]
-                .str.lower()
+    if q:
+        # Normalize query and data for search
+        q_normalized = (
+            (
+                q.lower()
                 .str.replace(" ", "", regex=False)
                 .str.replace("-", "", regex=False)
                 .str.replace(":", "", regex=False)
             )
-            mask = df_normalized.str.contains(q_normalized, na=False)
-            res = df[mask].head(50)
+            if hasattr(q, "str")
+            else q.lower().replace(" ", "").replace("-", "").replace(":", "")
+        )
 
-            # Lưu kết quả vào session state
-            st.session_state["search_results"] = res
-            st.session_state["last_query"] = q
+        df_normalized = (
+            df["title"]
+            .str.lower()
+            .str.replace(" ", "", regex=False)
+            .str.replace("-", "", regex=False)
+            .str.replace(":", "", regex=False)
+        )
+        mask = df_normalized.str.contains(q_normalized, na=False)
+        res = df[mask].head(50)
 
-            if len(res) > 0:
-                # push to history
-                push_history(q)
-            else:
-                st.session_state["search_results"] = None
+        # Lưu kết quả vào session state
+        st.session_state["search_results"] = res
+        st.session_state["last_query"] = q
+
+        if len(res) > 0:
+            # push to history
+            push_history(q)
+        else:
+            st.session_state["search_results"] = None
 
     # Display search results from session state
     if st.session_state["search_results"] is not None and len(st.session_state["search_results"]) > 0:
@@ -500,6 +756,42 @@ with tab2:
         display_movie_list(res, key_prefix="search")
     elif st.session_state.get("last_query") and st.session_state["search_results"] is not None:
         st.warning(f"❌ No movies found with keyword: **{st.session_state['last_query']}**")
+
+    st.markdown("---")
+
+    # Liked Movies Section
+    st.subheader("❤️ Your Liked Movies")
+    if st.session_state["liked_movies"]:
+        st.success(f"You have liked {len(st.session_state['liked_movies'])} movies")
+
+        # Display liked movies
+        with st.expander("📋 View Liked Movies", expanded=False):
+            for idx, movie_title in enumerate(st.session_state["liked_movies"], 1):
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.write(f"{idx}. {movie_title}")
+                with col2:
+                    if st.button("🗑️", key=f"remove_liked_{idx}", help="Remove from liked"):
+                        st.session_state["liked_movies"].remove(movie_title)
+                        st.session_state["liked_recommendations"] = None
+                        st.rerun()
+
+        st.markdown("---")
+        st.subheader("💖 Because you liked these movies, you might also enjoy:")
+
+        if st.session_state["liked_recommendations"] is None:
+            with st.spinner("Analyzing your preferences..."):
+                recommendations = recommend_by_liked_movies(st.session_state["liked_movies"], topn=9)
+                st.session_state["liked_recommendations"] = recommendations
+        else:
+            recommendations = st.session_state["liked_recommendations"]
+
+        if not recommendations.empty:
+            display_movie_cards(recommendations, key_prefix="liked_recs")
+        else:
+            st.info("Not enough data to recommend suitable movies")
+    else:
+        st.info("You haven't liked any movies yet. Start liking movies to get personalized recommendations!")
 
     st.markdown("---")
     st.subheader("📜 Search History (5 most recent)")
@@ -527,7 +819,10 @@ with tab2:
         st.info("No search history yet")
 
 with tab3:
-    st.header("📊 Data Statistics & Visualizations")
+    st.markdown(
+        '<div class="page-header"><h1>📊 Data Statistics & Visualizations</h1><p>Explore comprehensive analytics and insights from our movie database</p></div>',
+        unsafe_allow_html=True,
+    )
 
     st.write("Explore various statistical visualizations of the movie dataset")
 
@@ -599,7 +894,10 @@ with tab3:
         st.metric("Unique Genres", f"{df['genres_list'].explode().nunique():,}")
 
 with tab4:
-    st.header("📊 Recommendation System Evaluation")
+    st.markdown(
+        '<div class="page-header"><h1>📊 System Evaluation</h1><p>Measure and analyze recommendation system performance</p></div>',
+        unsafe_allow_html=True,
+    )
 
     display_evaluation_info()
     st.markdown("---")
@@ -625,8 +923,10 @@ with tab4:
             st.success("✅ Saved to evaluation_results.csv")
 
 with tab5:
-    st.header("🤖 AI Chatbot - Ask About Movies")
-    st.markdown("Chat with AI to get personalized movie recommendations and information")
+    st.markdown(
+        '<div class="page-header"><h1>🤖 AI Movie Assistant</h1><p>Chat with our AI to get personalized movie recommendations and insights</p></div>',
+        unsafe_allow_html=True,
+    )
 
     # Initialize chatbot session state
     if "chat_messages" not in st.session_state:
@@ -719,8 +1019,17 @@ with tab5:
                             st.session_state["chat_base_url"] = base_url_input
                             st.session_state["chat_api_key_verified"] = True
 
-                            # Use already computed embeddings (no need to recompute!)
-                            st.session_state["chat_embeddings"] = embeddings
+                            # Only compute embeddings if ChromaDB not available
+                            if chromadb_collection is not None:
+                                # Using ChromaDB for RAG - no local embeddings needed
+                                st.session_state["chat_embeddings"] = None
+                                st.info("🌐 Chatbot will use ChromaDB Cloud for RAG")
+                            elif embeddings is not None:
+                                # Use already computed embeddings
+                                st.session_state["chat_embeddings"] = embeddings
+                            else:
+                                # Compute embeddings for chatbot if not available
+                                st.session_state["chat_embeddings"] = compute_embeddings(df["combined"].tolist(), model)
 
                             st.success("✅ Model verified successfully!")
                             st.rerun()
@@ -798,9 +1107,14 @@ with tab5:
         # Generate response
         with st.chat_message("assistant"):
             with st.spinner("🔍 Searching database and generating response..."):
-                # Step 1: Retrieve relevant movies (RAG)
+                # Step 1: Retrieve relevant movies (RAG with ChromaDB support)
                 relevant_movies, scores = retrieve_relevant_movies(
-                    user_input, st.session_state["chat_embeddings"], df, model, top_k=10
+                    user_input,
+                    st.session_state["chat_embeddings"],
+                    df,
+                    model,
+                    top_k=50,
+                    chromadb_collection=chromadb_collection,
                 )
 
                 # Debug: Show how many movies were retrieved

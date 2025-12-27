@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.14.2",
+    "chromadb>=1.4.0",
     "ipykernel>=7.1.0",
     "litellm>=1.80.11",
     "num2words>=0.5.14",
@@ -18,5 +19,6 @@ dependencies = [
     "selenium>=4.38.0",
     "sentence-transformers>=5.1.2",
     "streamlit>=1.51.0",
+    "tqdm>=4.67.1",
     "webdriver-manager>=4.0.2",
 ]

@@ -9,3 +9,14 @@ wheels/
 # Virtual environments
 .venv
 data_handle
+
+# Streamlit secrets - IMPORTANT: Never commit this file
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
