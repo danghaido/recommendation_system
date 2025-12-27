@@ -486,7 +486,7 @@ def recommend_by_context(title, context_time=None, context_mood=None, topn=10):
 
 def display_movie_list(movie_df, key_prefix="movie", show_like_button=True):
     """Hiển thị danh sách phim với nút Mô tả và nút Like - Enhanced UI."""
-    for idx, row in movie_df.iterrows():
+    for movie_idx, (idx, row) in enumerate(movie_df.iterrows()):
         is_liked = row["title"] in st.session_state["liked_movies"]
 
         st.markdown(
@@ -505,7 +505,7 @@ def display_movie_list(movie_df, key_prefix="movie", show_like_button=True):
         col1, col2, col3 = st.columns([1, 1, 4])
 
         with col1:
-            btn_key = f"{key_prefix}_{idx}"
+            btn_key = f"{key_prefix}_{movie_idx}"
             if st.button("📖 Description", key=btn_key, use_container_width=True):
                 st.session_state[f"show_overview_{btn_key}"] = not st.session_state.get(
                     f"show_overview_{btn_key}", False
@@ -513,7 +513,7 @@ def display_movie_list(movie_df, key_prefix="movie", show_like_button=True):
 
         with col2:
             if show_like_button:
-                like_btn_key = f"like_{key_prefix}_{idx}"
+                like_btn_key = f"like_{key_prefix}_{movie_idx}"
                 if is_liked:
                     if st.button("💔 Unlike", key=like_btn_key, use_container_width=True):
                         st.session_state["liked_movies"].remove(row["title"])
@@ -573,7 +573,7 @@ def display_movie_cards(movie_df, key_prefix="card", show_like_button=True):
                     btn_col1, btn_col2 = st.columns(2)
 
                     with btn_col1:
-                        btn_key = f"{key_prefix}_{idx}"
+                        btn_key = f"{key_prefix}_{movie_idx}"
                         if st.button("📖 Description", key=btn_key, use_container_width=True):
                             st.session_state[f"show_overview_{btn_key}"] = not st.session_state.get(
                                 f"show_overview_{btn_key}", False
@@ -581,7 +581,7 @@ def display_movie_cards(movie_df, key_prefix="card", show_like_button=True):
 
                     with btn_col2:
                         if show_like_button:
-                            like_btn_key = f"like_{key_prefix}_{idx}"
+                            like_btn_key = f"like_{key_prefix}_{movie_idx}"
                             if is_liked:
                                 if st.button("💔 Unlike", key=like_btn_key, use_container_width=True):
                                     st.session_state["liked_movies"].remove(row["title"])
